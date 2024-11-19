@@ -9,7 +9,7 @@ logs/
 model_data/
 .temp_miou_out/
 dataset/
-Brain_output/
+output/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
