@@ -1,4 +1,4 @@
-# predict.py
+# improved_kmeans.py
 
 import os
 import sys
@@ -7,19 +7,14 @@ from PIL import Image
 import scipy.io
 from matplotlib import cm
 from tqdm import tqdm
+from sklearn.cluster import KMeans
+from sklearn.metrics import confusion_matrix
+from scipy.optimize import linear_sum_assignment
+import cv2  # OpenCV 库用于图像处理
 
-from unet import Unet
 from utils.utils_metrics import compute_mIoU, show_results
 
-# 导入 kmeans.py 中的函数
-from kmeans import segment_image_kmeans
-
-# 添加 remap_labels 函数
-from scipy.optimize import linear_sum_assignment
-
 def remap_labels(predicted_labels, true_labels, num_classes):
-    from sklearn.metrics import confusion_matrix
-
     # 计算混淆矩阵
     cm = confusion_matrix(true_labels.flatten(), predicted_labels.flatten(), labels=range(num_classes))
 
@@ -63,6 +58,7 @@ def main():
         sys.exit(1)
 
     num_slices = images.shape[2]
+    original_size = images.shape[:2]  # (height, width)
 
     # 定义类别信息
     name_classes = ['background', 'skin/scalp', 'skull', 'CSF', 'Gray Matter', 'White Matter']  # 根据实际类别修改
@@ -72,81 +68,8 @@ def main():
     output_root = 'output'
     os.makedirs(output_root, exist_ok=True)
 
-    # -------------------- 使用 Unet 进行预测 --------------------
     # 创建输出文件夹
-    unet_output_folder = os.path.join(output_root, 'unet_' + os.path.splitext(mat_filename)[0] + '_output')
-    os.makedirs(unet_output_folder, exist_ok=True)
-    # 创建子文件夹
-    unet_predicted_labels_folder = os.path.join(unet_output_folder, 'predicted_labels')
-    unet_pseudocolor_folder = os.path.join(unet_output_folder, 'pseudocolor_images')
-    unet_overlay_folder = os.path.join(unet_output_folder, 'overlay_images')
-    os.makedirs(unet_predicted_labels_folder, exist_ok=True)
-    os.makedirs(unet_pseudocolor_folder, exist_ok=True)
-    os.makedirs(unet_overlay_folder, exist_ok=True)
-
-    # 定义模型
-    unet = Unet()
-
-    # 保存真实标签和预测标签的路径，用于计算 mIoU
-    unet_gt_dir = os.path.join(unet_output_folder, 'gt_labels')
-    os.makedirs(unet_gt_dir, exist_ok=True)
-
-    print("开始使用 Unet 进行预测...")
-    for i in tqdm(range(num_slices)):
-        # 提取第 i 张切片的图像和标签
-        image_slice = images[:, :, i]
-        label_slice = labels[:, :, i]
-
-        # 对图像进行归一化，转换为 0-255 的 uint8 类型
-        image_slice_normalized = (image_slice - image_slice.min()) / (image_slice.max() - image_slice.min()) * 255
-        image_slice_normalized = image_slice_normalized.astype(np.uint8)
-
-        # 将图像转换为 PIL Image
-        image_pil = Image.fromarray(image_slice_normalized)
-
-        # 进行模型预测
-        predicted = unet.get_miou_png(image_pil)
-
-        # 将预测结果转换为 numpy 数组
-        predicted_array = np.array(predicted)
-
-        # 保存预测标签
-        Image.fromarray(predicted_array.astype(np.uint8)).save(os.path.join(unet_predicted_labels_folder, f"label_{i:03d}.png"))
-
-        # 保存真实标签
-        Image.fromarray(label_slice.astype(np.uint8)).save(os.path.join(unet_gt_dir, f"label_{i:03d}.png"))
-
-        # 生成伪彩色图像
-        colormap = cm.get_cmap('jet', num_classes)
-        pseudocolor = colormap(predicted_array / (num_classes - 1))  # 归一化
-        pseudocolor = (pseudocolor[:, :, :3] * 255).astype(np.uint8)
-        Image.fromarray(pseudocolor).save(os.path.join(unet_pseudocolor_folder, f"pseudocolor_{i:03d}.png"))
-
-        # 生成叠加图
-        original_image = image_pil.convert('RGBA')
-        pseudocolor_image = Image.fromarray(pseudocolor).convert('RGBA')
-        overlay_image = Image.blend(original_image, pseudocolor_image, alpha=0.5)
-        overlay_image.save(os.path.join(unet_overlay_folder, f"overlay_{i:03d}.png"))
-
-    print("Unet 预测完成，开始计算 mIoU...")
-
-    # 计算整体的 mIoU
-    image_ids = [f"label_{i:03d}" for i in range(num_slices)]
-    hist, IoUs, PA_Recall, Precision = compute_mIoU(unet_gt_dir, unet_predicted_labels_folder, image_ids, num_classes, name_classes)
-
-    # 保存 mIoU 结果
-    results_file = os.path.join(unet_output_folder, 'miou_results.txt')
-    with open(results_file, 'w') as f:
-        f.write("\nUnet Prediction Overall mIoU:\n")
-        for idx in range(num_classes):
-            f.write(f"Class {name_classes[idx]}: IoU = {IoUs[idx]:.4f}\n")
-        f.write(f"\nMean mIoU: {np.nanmean(IoUs):.4f}\n")
-
-    print("Unet mIoU 计算完成，结果已保存。")
-
-    # -------------------- 使用 K-means 进行预测 --------------------
-    # 创建输出文件夹
-    kmeans_output_folder = os.path.join(output_root, 'kmeans_' + os.path.splitext(mat_filename)[0] + '_output')
+    kmeans_output_folder = os.path.join(output_root, 'improved_kmeans_' + os.path.splitext(mat_filename)[0] + '_output')
     os.makedirs(kmeans_output_folder, exist_ok=True)
     # 创建子文件夹
     kmeans_predicted_labels_folder = os.path.join(kmeans_output_folder, 'predicted_labels')
@@ -160,18 +83,33 @@ def main():
     kmeans_gt_dir = os.path.join(kmeans_output_folder, 'gt_labels')
     os.makedirs(kmeans_gt_dir, exist_ok=True)
 
-    print("开始使用 K-means 进行预测...")
+    print("开始使用改进的 K-means 进行预测...")
+
     for i in tqdm(range(num_slices)):
         # 提取第 i 张切片的图像和标签
         image_slice = images[:, :, i]
         label_slice = labels[:, :, i]
 
         # 对图像进行归一化，转换为 0-255 的 uint8 类型
-        image_slice_normalized = (image_slice - image_slice.min()) / (image_slice.max() - image_slice.min()) * 255
-        image_slice_normalized = image_slice_normalized.astype(np.uint8)
+        image_normalized = (image_slice - image_slice.min()) / (image_slice.max() - image_slice.min()) * 255
+        image_normalized = image_normalized.astype(np.uint8)
 
-        # 进行 K-means 分割，不添加空间信息
-        predicted_labels = segment_image_kmeans(image_slice_normalized, n_clusters=num_classes)
+        # 使用高斯滤波进行平滑
+        image_smoothed = cv2.GaussianBlur(image_normalized, (5, 5), 0)
+
+        # 使用 Canny 边缘检测
+        edges = cv2.Canny(image_smoothed, threshold1=50, threshold2=150)
+
+        # 构建特征向量，包括像素值和边缘信息
+        h, w = image_normalized.shape
+        pixels = image_normalized.flatten()
+        edges_flat = edges.flatten()
+        features = np.stack((pixels, edges_flat), axis=1)
+
+        # 进行 K-means 分割
+        kmeans = KMeans(n_clusters=num_classes, random_state=0)
+        kmeans.fit(features)
+        predicted_labels = kmeans.labels_.reshape(h, w)
 
         # 对预测结果进行标签映射
         remapped_labels = remap_labels(predicted_labels, label_slice, num_classes)
@@ -189,12 +127,12 @@ def main():
         Image.fromarray(pseudocolor).save(os.path.join(kmeans_pseudocolor_folder, f"pseudocolor_{i:03d}.png"))
 
         # 生成叠加图
-        original_image = Image.fromarray(image_slice_normalized).convert('RGBA')
+        original_image = Image.fromarray(image_normalized).convert('RGBA')
         pseudocolor_image = Image.fromarray(pseudocolor).convert('RGBA')
         overlay_image = Image.blend(original_image, pseudocolor_image, alpha=0.5)
         overlay_image.save(os.path.join(kmeans_overlay_folder, f"overlay_{i:03d}.png"))
 
-    print("K-means 预测完成，开始计算 mIoU...")
+    print("改进的 K-means 预测完成，开始计算 mIoU...")
 
     # 计算整体的 mIoU
     image_ids = [f"label_{i:03d}" for i in range(num_slices)]
@@ -203,12 +141,12 @@ def main():
     # 保存 mIoU 结果
     results_file = os.path.join(kmeans_output_folder, 'miou_results.txt')
     with open(results_file, 'w') as f:
-        f.write("\nK-means Prediction Overall mIoU:\n")
+        f.write("\nImproved K-means Prediction Overall mIoU:\n")
         for idx in range(num_classes):
             f.write(f"Class {name_classes[idx]}: IoU = {IoUs[idx]:.4f}\n")
         f.write(f"\nMean mIoU: {np.nanmean(IoUs):.4f}\n")
 
-    print("K-means mIoU 计算完成，结果已保存。")
+    print("改进的 K-means mIoU 计算完成，结果已保存。")
 
 if __name__ == "__main__":
     main()
